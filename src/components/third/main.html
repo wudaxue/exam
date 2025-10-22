@@ -1,0 +1,220 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Main</title>
+  <style>button{margin:6px}</style>
+</head>
+<body>
+  <div>
+    <button id="btnSendToIframe1">通知 iframe1（调用）</button>
+  </div>
+  <div id="iframes"></div>
+
+<script>
+function base64Encode(obj){
+  return btoa(JSON.stringify(obj));
+}
+function base64Decode(str){
+  try { return JSON.parse(atob(str)); }
+  catch(e){ return null; }
+}
+function genKey(){ return 'k_' + Date.now() + '_' + Math.random().toString(36).slice(2,9); }
+
+/* --- parent side storage --- */
+const iframesMap = new Map(); // id -> {win, origin, token}
+const pending = new Map(); // key -> {resolve, reject, timer}
+
+/* --- create some sample iframes with tokens (for demo) --- */
+function createIframe(id, srcOrigin){
+  // generate simple token (in real场景用更安全的签名)
+  const token = btoa(id + '::' + Math.random().toString(36).slice(2));
+  const iframe = document.createElement('iframe');
+  // make src point to iframe.html (same origin demo) with query params
+  // replace srcOrigin with actual URL if cross-domain
+  iframe.src = `${srcOrigin || 'iframe.html'}?id=${id}&token=${encodeURIComponent(token)}`;
+  iframe.width = "600";
+  iframe.height = "120";
+  iframe.style.display = "block";
+  iframe.style.marginBottom = "8px";
+  document.getElementById('iframes').appendChild(iframe);
+  // store token for later validation (origin will be known after registration)
+  iframesMap.set(id, {win: null, origin: null, token}); // win filled on register
+}
+
+/* --- Create 3 iframes for the test --- */
+createIframe('iframe1'); // will load ./iframe.html?id=iframe1&token=...
+createIframe('iframe2');
+createIframe('iframe3');
+
+/* --- message handler (parent listens for registrations and invocations) --- */
+window.addEventListener('message', (ev) => {
+  // For real cross-origin, ev.origin is crucial. For local demo same origin allowed.
+  const msg = ev.data;
+  if (!msg || !msg.type) return;
+  // console.log('Parent recv', msg, 'from origin', ev.origin);
+
+  if (msg.type === 'register'){
+    // iframe发送注册请求： { type:'register', id, token }
+    const record = iframesMap.get(msg.id);
+    if (!record) {
+      ev.source.postMessage({ type:'error', reason:'unknown id' }, ev.origin);
+      return;
+    }
+    // validate token
+    if (msg.token !== record.token){
+      ev.source.postMessage({ type:'error', reason:'bad token' }, ev.origin);
+      return;
+    }
+    // accept and store window & origin
+    record.win = ev.source;
+    record.origin = ev.origin;
+    iframesMap.set(msg.id, record);
+    console.log(`Parent: 已注册 ${msg.id} 来自 ${ev.origin}`);
+    // respond ack
+    ev.source.postMessage({ type:'register_ack', id: msg.id }, ev.origin);
+    return;
+  }
+
+  // 验证消息来源是否为已注册的 iframe (安全)
+  // If message from parent itself (ev.source === window) allow
+  let srcId = msg.from;
+  if (ev.source !== window){
+    const rec = srcId ? iframesMap.get(srcId) : null;
+    if (!rec || rec.win !== ev.source){
+      // unknown source => ignore
+      console.warn('Parent: 来自未注册源的消息，已忽略', msg);
+      return;
+    }
+    // optionally check ev.origin === rec.origin
+    if (rec.origin && rec.origin !== ev.origin){
+      console.warn('Parent: origin mismatch, ignore', ev.origin, rec.origin);
+      return;
+    }
+  }
+
+  if (msg.type === 'invoke'){
+    // iframe -> parent: 请求主页面代发或主页面执行命令
+    handleInvokeFrom(msg, ev.origin);
+    return;
+  }
+
+  if (msg.type === 'response' || msg.type === 'invoke_result'){
+    // resolve pending promise
+    const p = pending.get(msg.key);
+    if (p){
+      clearTimeout(p.timer);
+      pending.delete(msg.key);
+      p.resolve(msg);
+    }
+    return;
+  }
+
+  if (msg.type === 'log'){
+    // 只做展示用途
+    console.log('来自 iframe 的 log:', msg.from, base64Decode(msg.payload));
+    return;
+  }
+});
+
+function handleInvokeFrom(msg, origin){
+  // msg: {type:'invoke', key, from, to, payload (Base64)}
+  if (!msg.to || msg.to === 'parent'){
+    // parent 执行命令（这里简单演示 echo）
+    const decoded = base64Decode(msg.payload);
+    console.log(`Parent: 收到来自 ${msg.from} 的调用，请求体:`, decoded);
+    // 返回结果
+    const resp = { type:'response', key: msg.key, from: 'parent', to: msg.from, payload: base64Encode({status:'ok', echo: decoded})};
+    // send back to caller iframe
+    const caller = iframesMap.get(msg.from);
+    if (caller && caller.win){
+      caller.win.postMessage(resp, caller.origin || '*');
+    }
+    return;
+  }
+
+  // 转发给指定 iframe (iframe -> iframe via parent)
+  const target = iframesMap.get(msg.to);
+  if (!target || !target.win){
+    // target 未注册，返回 error
+    const caller = iframesMap.get(msg.from);
+    if (caller && caller.win){
+      caller.win.postMessage({ type:'error', key: msg.key, reason:'target_not_found' }, caller.origin || '*');
+    }
+    return;
+  }
+
+  // 构造转发消息，附带 via (parent host)
+  const forward = {
+    type: 'invoke',
+    key: msg.key,
+    from: msg.from,
+    to: msg.to,
+    payload: msg.payload,
+    via: location.host // 告知中转方主页面 host
+  };
+  // 转发给目标 iframe
+  target.win.postMessage(forward, target.origin || '*');
+
+  // parent 同时在 pending 中等待 target 的 response（proxy）
+  const timer = setTimeout(()=> {
+    const caller = iframesMap.get(msg.from);
+    const p = pending.get(msg.key);
+    if (p) { p.reject(new Error('timeout')); pending.delete(msg.key); }
+    if (caller && caller.win){
+      caller.win.postMessage({ type:'error', key: msg.key, reason:'timeout' }, caller.origin || '*');
+    }
+  }, 10000);
+
+  pending.set(msg.key, {
+    resolve: (r) => {
+      // r 来自 target 的 response，需要回传给原始 caller
+      const caller = iframesMap.get(msg.from);
+      if (caller && caller.win){
+        // 在回复中附带 via 信息（说明是从哪个 host 中转回）
+        const respBack = { type:'response', key: msg.key, from: msg.to, to: msg.from, payload: r.payload, via: location.host };
+        caller.win.postMessage(respBack, caller.origin || '*');
+      }
+    },
+    reject: (err) => console.warn('forward rejected', err),
+    timer
+  });
+}
+
+/* --- parent 发起调用（示例：通知 iframe1 打印信息） --- */
+document.getElementById('btnSendToIframe1').addEventListener('click', async () => {
+  const targetId = 'iframe1';
+  const payloadObj = { msg: `iframe1 收到来自主页面的消息： ${new Date().toLocaleString()}` };
+  const key = genKey();
+  const encoded = base64Encode(payloadObj);
+
+  // we use invoke with to=iframe1
+  // parent 发起调用并等待 response
+  try {
+    const res = await parentInvoke({ key, from: 'parent', to: targetId, payload: encoded });
+    const decoded = base64Decode(res.payload);
+    console.log(`iframe1 已成功执行命令： ${res.key}`, decoded);
+  } catch (e){
+    console.warn('调用失败', e);
+  }
+});
+
+/* parentInvoke: 主页面向某 iframe 发起调用并等待响应 */
+function parentInvoke({key, from, to, payload}){
+  return new Promise((resolve, reject) => {
+    const target = iframesMap.get(to);
+    if (!target || !target.win) return reject(new Error('target not ready'));
+    // send
+    const msg = { type:'invoke', key, from, to, payload };
+    // wait response
+    const timer = setTimeout(()=> {
+      pending.delete(key);
+      reject(new Error('timeout'));
+    }, 10000);
+    pending.set(key, { resolve: (r)=>{ clearTimeout(timer); pending.delete(key); resolve(r); }, reject, timer });
+    target.win.postMessage(msg, target.origin || '*');
+  });
+}
+</script>
+</body>
+</html>
